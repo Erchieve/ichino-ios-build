@@ -1,4 +1,4 @@
-name: Build iOS signed IPA
+name: Build iOS unsigned IPA
 
 on:
   push:
@@ -8,15 +8,7 @@ on:
 jobs:
   build-ios:
     runs-on: macos-latest
-    timeout-minutes: 90
-
-    env:
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-      CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
-      TEAM_ID: ${{ secrets.TEAM_ID }}
-
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,28 +16,16 @@ jobs:
       - name: Extract source zip
         shell: bash
         run: |
-          set -eux
+          set -e
           ls -la
-
           if [ ! -f source.zip ]; then
-            echo "::error::source.zip not found in repo root. Please upload it to the repository root."
+            echo "::error::source.zip 没有找到，请确认已上传到仓库根目录"
             exit 1
           fi
-
           mkdir -p src
           unzip -q source.zip -d src
-
-          echo "---- src directory ----"
-          ls -la src | head -50
-
-          PROJECT_DIR=$(find src -maxdepth 5 -name pubspec.yaml -print -quit | xargs dirname)
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "::error::Unable to find Flutter project root in source.zip"
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Flutter project root: $PROJECT_DIR"
+          echo "---- src 顶层 ----"
+          ls -la src | head -40
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -59,101 +39,26 @@ jobs:
           flutter --version
           xcodebuild -version
 
-      - name: Setup signing cert and provisioning profile
-        shell: bash
+      - name: Build iOS (no codesign)
+        working-directory: src
         run: |
-          set -eux
-
-          if [ -z "$KEYCHAIN_PASSWORD" ] || [ -z "$CERTIFICATE_BASE64" ] || [ -z "$CERTIFICATE_PASSWORD" ] || [ -z "$PROVISIONING_PROFILE_BASE64" ] || [ -z "$TEAM_ID" ]; then
-            echo "::error::Missing required GitHub Secrets: KEYCHAIN_PASSWORD, APPLE_CERTIFICATE_P12_BASE64, APPLE_CERTIFICATE_PASSWORD, PROVISIONING_PROFILE_BASE64, TEAM_ID"
-            exit 1
-          fi
-
-          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed 's/"//g')
-
-          echo "$CERTIFICATE_BASE64" | base64 --decode > certificate.p12
-          security import certificate.p12 -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_PASSWORD" -A
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
-
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > profile.mobileprovision
-          cp profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
-
-          ls -l "$HOME/Library/MobileDevice/Provisioning Profiles"
-
-      - name: Create export options plist
-        shell: bash
-        run: |
-          set -eux
-
-          BUNDLE_ID=$(grep -A1 "CFBundleIdentifier" "$PROJECT_DIR/ios/Runner/Info.plist" | tail -n 1 | sed -E 's#.*<string>(.*)</string>.*#\1#' | tr -d '\r')
-          PROFILE_NAME=$(ls "$HOME/Library/MobileDevice/Provisioning Profiles" | head -n 1)
-
-          if [ -z "$BUNDLE_ID" ] || [ -z "$PROFILE_NAME" ]; then
-            echo "::error::Could not detect bundle ID or provisioning profile name"
-            exit 1
-          fi
-
-          cat > ExportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>compileBitcode</key>
-              <false/>
-              <key>destination</key>
-              <string>export</string>
-              <key>method</key>
-              <string>ad-hoc</string>
-              <key>provisioningProfiles</key>
-              <dict>
-                  <key>$BUNDLE_ID</key>
-                  <string>$PROFILE_NAME</string>
-              </dict>
-              <key>signingStyle</key>
-              <string>manual</string>
-              <key>stripSwiftSymbols</key>
-              <true/>
-              <key>teamID</key>
-              <string>$TEAM_ID</string>
-              <key>uploadBitcode</key>
-              <false/>
-              <key>uploadSymbols</key>
-              <false/>
-          </dict>
-          </plist>
-          EOF
-
-          echo "Bundle ID: $BUNDLE_ID"
-          echo "Provisioning profile: $PROFILE_NAME"
-          cat ExportOptions.plist
-
-      - name: Build signed IPA
-        shell: bash
-        run: |
-          set -eux
-          cd "$PROJECT_DIR"
+          set -e
           flutter pub get
-          flutter build ipa --release --export-options-plist "$PROJECT_DIR/ExportOptions.plist" 2>&1 | tee build-ipa.log
+          flutter build ios --release --no-codesign 2>&1 | tee build-ios.log
 
-          IPA_PATH=$(find "$PROJECT_DIR/build/ios/ipa" -name "*.ipa" | head -n 1)
-          if [ -z "$IPA_PATH" ]; then
-            echo "::error::No .ipa file generated"
-            exit 1
-          fi
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          ls -la src/build/ios/iphoneos/
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R src/build/ios/iphoneos/Runner.app Payload/
+          zip -qry ichino-ios-unsigned.ipa Payload
+          ls -lh ichino-ios-unsigned.ipa
 
-          echo "IPA_PATH=$IPA_PATH" >> "$GITHUB_ENV"
-          ls -lh "$IPA_PATH"
-
-      - name: Upload signed IPA
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: signed-ios-ipa
-          path: ${{ env.IPA_PATH }}
+          name: ichino-ios-unsigned-ipa
+          path: ichino-ios-unsigned.ipa
           if-no-files-found: error
